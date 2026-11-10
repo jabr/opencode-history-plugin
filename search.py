@@ -274,11 +274,14 @@ def session_doc_ids(conn: sqlite3.Connection, session_id: str) -> list[str]:
     ]
 
 
-def result_rows(results, scope: dict) -> list[dict]:
-    """Rows carry only the IDs that actually vary — the scope object above
-    them states the rest: projectID appears only in cross-project (merged)
-    search, sessionID only when not session-scoped. Agents work from the
-    message ID; the scope is for confirming what was searched."""
+def result_rows(conn: sqlite3.Connection, results, scope: dict) -> list[dict]:
+    """IDs that vary per hit, plus the same enrichment the human face shows:
+    the owning project's directory (cross-project only), the session title,
+    the message type, and its local timestamp. A model reading JSON gets the
+    context a human gets from the markdown — which project/conversation/when
+    a hit is from — without a second lookup per hit. Title/type/time are
+    enrichment: lookups are guarded and omitted (not nulled) when unknown, so
+    they can never break the listing."""
     rows = []
     for result in results:
         chunk = result.chunk
@@ -287,10 +290,28 @@ def result_rows(results, scope: dict) -> list[dict]:
         if scope["project"] is None:
             # Merged cross-project indexes prefix chunk paths with the project
             # ID (3 segments); single-project indexes do not (2 segments).
-            row["projectID"] = parts[0] if len(parts) == 3 else None
+            project_id = parts[0] if len(parts) == 3 else None
+            if project_id:
+                row["projectID"] = project_id
+                # The project ID hash means nothing to a reader — carry the
+                # directory label the human face prints.
+                row["project"] = project_label(conn, project_id)
         if scope["session"] is None:
             row["sessionID"] = parts[-2] if len(parts) >= 2 else ""
         row["messageID"] = parts[-1].removesuffix(".md")
+        info = conn.execute(
+            "SELECT s.title, m.type, m.time_created FROM session_message m"
+            " JOIN session_v2 s ON s.id = m.session_id WHERE m.id = ?",
+            (row["messageID"],),
+        ).fetchone()
+        if info:
+            title, mtype, created = info
+            if title:
+                row["title"] = title
+            if mtype:
+                row["type"] = mtype
+                if isinstance(created, int) and created > 0:
+                    row["time"] = time.strftime("%b %e %Y, %H:%M", time.localtime(created / 1000))
         row["score"] = result.score
         row["snippet"] = chunk.content
         rows.append(row)
@@ -322,34 +343,29 @@ def project_label(conn: sqlite3.Connection, project_id: str) -> str:
     return row[0].replace(str(Path.home()), "~", 1)
 
 
-def render_human(conn: sqlite3.Connection, query: str, rows: list[dict], scope: dict) -> None:
+def render_human(query: str, rows: list[dict], scope: dict) -> None:
     if not rows:
         print(f"no matches for: {query}")
         return
     # One markdown section per hit: the session title as the heading, a meta
     # line with the copyable message ID (the handle for -m), then a capped
     # excerpt as an indented code block — indented so markdown inside the
-    # message itself stays inert. Titles and message times are enrichment —
-    # they must never break the listing, so lookups are guarded.
+    # message itself stays inert. All metadata comes from result_rows, whose
+    # guarded lookups already omit anything unknown, so nothing here can
+    # break the listing.
     doc = []
     for i, row in enumerate(rows, 1):
-        info = conn.execute(
-            "SELECT s.title, m.type, m.time_created FROM session_message m"
-            " JOIN session_v2 s ON s.id = m.session_id WHERE m.id = ?",
-            (row["messageID"],),
-        ).fetchone()
-        title, mtype, created = info if info else (None, None, None)
         meta = [f"`{row['messageID']}`"]
-        # Cross-project (merged) search: say which project each hit is from,
-        # by directory — the project ID hash means nothing to a human.
-        if scope["project"] is None and row.get("projectID"):
-            meta.append(project_label(conn, row["projectID"]))
-        if mtype:
-            meta.append(mtype)
-            if isinstance(created, int) and created > 0:
-                meta.append(time.strftime("%b %e %Y, %H:%M", time.localtime(created / 1000)))
+        if row.get("project"):
+            meta.append(row["project"])
+        if row.get("type"):
+            meta.append(row["type"])
+            if row.get("time"):
+                meta.append(row["time"])
         meta.append(f"score {row['score']:.3f}")
-        doc.append(f"### {i}. {title or row['sessionID']}\n\n{' · '.join(meta)}\n")
+        doc.append(
+            f"### {i}. {row.get('title') or row.get('sessionID') or scope.get('session') or row['messageID']}\n\n{' · '.join(meta)}\n"
+        )
         # Marker-only chunks (a hit on just the `## msg_…` header line) have no
         # excerpt worth printing.
         body = [line for line in row["snippet"].splitlines() if not line.startswith("## msg_")]
@@ -365,7 +381,7 @@ def render_human(conn: sqlite3.Connection, query: str, rows: list[dict], scope: 
     show_text("\n".join(doc))
 
 
-def emit(args, conn: sqlite3.Connection, query: str, rows: list[dict], scope: dict, stats: dict) -> None:
+def emit(args, query: str, rows: list[dict], scope: dict, stats: dict) -> None:
     if args.json:
         print(
             json.dumps(
@@ -374,7 +390,7 @@ def emit(args, conn: sqlite3.Connection, query: str, rows: list[dict], scope: di
             )
         )
         return
-    render_human(conn, query, rows, scope)
+    render_human(query, rows, scope)
 
 
 def run_search(args, cache_root: Path) -> None:
@@ -405,17 +421,17 @@ def run_search(args, cache_root: Path) -> None:
             (project,),
         ).fetchone()[0]
         if count == 0:
-            emit(args, conn, args.query, [], scope, {"cache": "empty", "documents": 0, "changed": 0, "build_ms": 0})
+            emit(args, args.query, [], scope, {"cache": "empty", "documents": 0, "changed": 0, "build_ms": 0})
             return
         index, stats = load_project_index(conn, project, cache_root, refresh=not args.no_refresh)
         doc_ids = session_doc_ids(conn, args.session) if args.session else None
         if args.session and not doc_ids:
             # Guard: an empty filter_paths list would silently degrade to an
             # unfiltered search of the whole project.
-            emit(args, conn, args.query, [], scope, stats)
+            emit(args, args.query, [], scope, stats)
             return
     results = index.search(args.query, top_k=args.top_k, filter_paths=doc_ids if doc_ids else None)
-    emit(args, conn, args.query, result_rows(results, scope), scope, stats)
+    emit(args, args.query, result_rows(conn, results, scope), scope, stats)
 
 
 def run_expand(args) -> None:

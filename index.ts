@@ -83,11 +83,16 @@ function truncate(text: string, max = MAX_TEXT): string {
 
 /** One search result row, as emitted by search.py --json. Only IDs that vary
  * per hit appear: projectID in cross-project search, sessionID when not
- * session-scoped — the scope object states the rest. */
+ * session-scoped. Enrichment (owning directory, session title, message
+ * type/time) is omitted when unknown. */
 type ResultRow = {
   projectID?: string
+  project?: string
   sessionID?: string
   messageID: string
+  title?: string
+  type?: string
+  time?: string
   score: number
   snippet: string
 }
@@ -109,8 +114,8 @@ export default Plugin.define({
           "Search full conversation history across sessions: what was discussed, decided, or tried — " +
           "use when asked why something was done or what past conversations concluded. " +
           "Indexes whole transcripts (reasoning, tool calls, and results included); " +
-          "results carry messageID + snippet per hit (sessionID too, unless session-scoped), " +
-          "the asker's own history included. " +
+          "results carry sessionID + messageID + snippet per hit, enriched with the session title, " +
+          "message type, timestamp, and (cross-project) the owning directory. " +
           "Defaults to all sessions in the project; `scope` narrows to one conversation. " +
           "A terminal twin, `history-search`, exists on PATH for shell pipelines.",
         input: {
@@ -132,6 +137,43 @@ export default Plugin.define({
           },
           required: ["query"],
           additionalProperties: false,
+        },
+        // Declared so Code Mode types the tool's return as this object.
+        // Undeclared outputs surface as `Promise<string | null>` — the raw
+        // content string — forcing every caller to JSON.parse (and to
+        // remember to). Raw JSON Schema output is not strictly validated,
+        // only required to be JSON-serializable, so this documents the shape
+        // without risking decode errors.
+        output: {
+          type: "object",
+          properties: {
+            query: { type: "string" },
+            scope: {
+              type: "object",
+              properties: {
+                project: { type: ["string", "null"] },
+                session: { type: ["string", "null"] },
+              },
+            },
+            results: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  projectID: { type: "string" },
+                  project: { type: "string" },
+                  sessionID: { type: "string" },
+                  messageID: { type: "string" },
+                  title: { type: "string" },
+                  type: { type: "string" },
+                  time: { type: "string" },
+                  score: { type: "number" },
+                  snippet: { type: "string" },
+                },
+              },
+            },
+            index: { type: "object" },
+          },
         },
         options: { namespace: "history", permission: "history_search", codemode: true },
         execute: async (raw) => {
@@ -169,7 +211,7 @@ export default Plugin.define({
           }
           const results = (out.results ?? []).map((row) => ({ ...row, snippet: truncate(row.snippet) }))
           return {
-            content: JSON.stringify({ query: input.query, scope: out.scope, results, index: out.index }),
+            output: { query: input.query, scope: out.scope, results, index: out.index },
           }
         },
       })

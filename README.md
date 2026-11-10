@@ -57,9 +57,12 @@ curiosity.
 | `project` | project ID to search another project's history, or `"all"` for cross-project search (opt-in; defaults to this project) |
 | `limit` | max results (default 20) |
 
-Results carry `messageID` + `snippet` per hit (and `sessionID`, unless
-session-scoped). A context hook injected on every model call tells agents the
-tool exists and when to reach for it, so no AGENTS.md section needs
+Results carry `sessionID` + `messageID` + `snippet` per hit, enriched with the
+session title, message type, and timestamp — and, in cross-project search, the
+owning directory — so a hit is attributable without a second lookup. The tool
+declares an `output` schema, so in Code Mode it returns the parsed object
+(no `JSON.parse` dance). A context hook injected on every model call tells
+agents the tool exists and when to reach for it, so no AGENTS.md section needs
 installing.
 
 The tool is registered `codemode: true` (catalog-only in Code Mode sessions),
@@ -128,10 +131,12 @@ Enforced in retrieval, never by post-filtering:
   `SembleIndex.merge` over every project's persisted index, rows carry
   `projectID`/`sessionID` since they vary.
 
-JSON rows carry only the IDs that vary (`scope` above them states the rest):
-project scope → `sessionID`, `messageID`, `score`, `snippet`; session scope →
-`messageID`, `score`, `snippet`; merged → both IDs. `"scope": {"project": null}`
-marks cross-project search.
+JSON rows carry the IDs that vary (`scope` above them states the rest):
+project scope → `sessionID`, `messageID`; session scope → `messageID`; merged
+→ both IDs plus `projectID`. Every row is enriched where known — `title`
+(session title), `type` (message type), `time` (local timestamp), and
+`project` (owning directory, merged search only) — unknown enrichment is
+omitted, not nulled. `"scope": {"project": null}` marks cross-project search.
 
 ## Project resolution (cwd → project, most authoritative first)
 
