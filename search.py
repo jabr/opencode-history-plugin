@@ -294,8 +294,9 @@ def result_rows(conn: sqlite3.Connection, results, scope: dict) -> list[dict]:
             if project_id:
                 row["projectID"] = project_id
                 # The project ID hash means nothing to a reader — carry the
-                # directory label the human face prints.
-                row["project"] = project_label(conn, project_id)
+                # directory label the human face prints. Named projectDir to
+                # stay clear of projectID/scope.project (IDs).
+                row["projectDir"] = project_label(conn, project_id)
         if scope["session"] is None:
             row["sessionID"] = parts[-2] if len(parts) >= 2 else ""
         row["messageID"] = parts[-1].removesuffix(".md")
@@ -356,8 +357,8 @@ def render_human(query: str, rows: list[dict], scope: dict) -> None:
     doc = []
     for i, row in enumerate(rows, 1):
         meta = [f"`{row['messageID']}`"]
-        if row.get("project"):
-            meta.append(row["project"])
+        if row.get("projectDir"):
+            meta.append(row["projectDir"])
         if row.get("type"):
             meta.append(row["type"])
             if row.get("time"):

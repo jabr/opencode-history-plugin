@@ -140,17 +140,22 @@ Enforced in retrieval, never by post-filtering:
 - **Project** — the index only ever contains that project's messages.
 - **Session** — the same index, with semble's pre-ranking selector
   (`filter_paths`) restricting retrieval to that session's documents *before*
-  top-k, so narrowing is exact (no truncation artifacts).
+  top-k, so narrowing is exact (no truncation artifacts). A session belongs to
+  exactly one project: another project's session requires an explicit
+  `project` ID — `all` + session is refused.
 - **Cross-project** — opt-in via `--project all` (or an unresolvable cwd);
   `SembleIndex.merge` over every project's persisted index, rows carry
   `projectID`/`sessionID` since they vary.
 
-JSON rows carry the IDs that vary (`scope` above them states the rest):
-project scope → `sessionID`, `messageID`; session scope → `messageID`; merged
-→ both IDs plus `projectID`. Every row is enriched where known — `title`
-(session title), `type` (message type), `time` (local timestamp), and
-`project` (owning directory, merged search only) — unknown enrichment is
-omitted, not nulled. `"scope": {"project": null}` marks cross-project search.
+JSON rows carry the IDs that vary; identity is echoed once in `scope`, not
+per hit — under a session scope, `projectID`/`projectDir`/`sessionID` are
+absent from rows. project scope → `sessionID`, `messageID`; session scope →
+`messageID`; merged → both IDs plus `projectID` and `projectDir` (owning
+directory; the IDs stay IDs — only `projectDir` is a path). Every row is
+enriched where known — `title`
+(session title), `type` (message type), `time` (local timestamp) — unknown
+enrichment is omitted, not nulled. `"scope": {"project": null}` marks
+cross-project search — `project: "all"`, or no resolvable project.
 
 ## Project resolution (cwd → project, most authoritative first)
 

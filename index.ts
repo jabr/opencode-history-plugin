@@ -113,7 +113,7 @@ function runLauncher(args: string[], label: string): string {
  * type/time) is omitted when unknown. */
 type ResultRow = {
   projectID?: string
-  project?: string
+  projectDir?: string
   sessionID?: string
   messageID: string
   title?: string
@@ -143,7 +143,10 @@ export default Plugin.define({
           "results carry sessionID + messageID + snippet per hit, enriched with the session title, " +
           "message type, timestamp, and (cross-project) the owning directory. " +
           "Expand a hit in full with history.expand. " +
-          "Defaults to all sessions in the project; `scope` narrows to one conversation.",
+          "Defaults to all sessions in the project; `scope` narrows to one conversation. " +
+          "Identity is echoed once in `scope`, not per hit: projectID/projectDir appear on hits only in " +
+          "cross-project search, sessionID only when not session-scoped. " +
+          "scope.project is null when searching all projects (merged) or when none could be resolved.",
         input: {
           type: "object",
           properties: {
@@ -153,11 +156,16 @@ export default Plugin.define({
             },
             scope: {
               type: "string",
-              description: "'all' (default — the whole project corpus) or a session ID (ses_…) for exactly that conversation.",
+              description:
+                "'all' (default — the whole project corpus) or a session ID (ses_…) for exactly that conversation. " +
+                "A session must belong to the searched project: another project's session requires passing that " +
+                "project's ID in `project`.",
             },
             project: {
               type: "string",
-              description: "project ID to search another project's history, or 'all' for cross-project search (opt-in; defaults to this project).",
+              description:
+                "project ID to search another project's history, or 'all' for cross-project search (opt-in; defaults to this project). " +
+                "'all' cannot be combined with a session scope.",
             },
             limit: { type: "integer", description: "max results (default 20)." },
           },
@@ -169,7 +177,9 @@ export default Plugin.define({
         // content string — forcing every caller to JSON.parse (and to
         // remember to). Raw JSON Schema output is not strictly validated,
         // only required to be JSON-serializable, so this documents the shape
-        // without risking decode errors.
+        // without risking decode errors. The per-hit identity properties
+        // carry their presence rules, since the row shape varies with scope
+        // and agents learn the shape from the hits they see.
         output: {
           type: "object",
           properties: {
@@ -177,8 +187,14 @@ export default Plugin.define({
             scope: {
               type: "object",
               properties: {
-                project: { type: ["string", "null"] },
-                session: { type: ["string", "null"] },
+                project: {
+                  type: ["string", "null"],
+                  description: "the project searched — null when searching all projects (merged)",
+                },
+                session: {
+                  type: ["string", "null"],
+                  description: "the session searched — set only under a session scope",
+                },
               },
             },
             results: {
@@ -186,9 +202,18 @@ export default Plugin.define({
               items: {
                 type: "object",
                 properties: {
-                  projectID: { type: "string" },
-                  project: { type: "string" },
-                  sessionID: { type: "string" },
+                  projectID: {
+                    type: "string",
+                    description: "owning project ID — cross-project search only; otherwise read `scope.project`",
+                  },
+                  projectDir: {
+                    type: "string",
+                    description: "owning project directory — cross-project search only (projectID is the ID; this is its path)",
+                  },
+                  sessionID: {
+                    type: "string",
+                    description: "owning session — omitted under a session scope; read `scope.session`",
+                  },
                   messageID: { type: "string" },
                   title: { type: "string" },
                   type: { type: "string" },
@@ -214,6 +239,7 @@ export default Plugin.define({
           // another project's history. search.py enforces this in the index
           // itself — only the scoped project's messages are ever searched.
           const scope = input.project ?? projectID
+          if (!scope) throw new Error("history search: no project for this location — pass `project`")
           const args = ["--json", "-k", String(input.limit ?? DEFAULT_LIMIT), "--project", scope]
           if (input.scope && input.scope !== "all") args.push("--session", input.scope)
           args.push(input.query)
