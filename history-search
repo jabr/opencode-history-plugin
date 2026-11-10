@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# history-search — launcher for search.py (the plugin's CLI).
+#
+# Runs the search CLI from a dedicated persistent venv
+# (~/.cache/opencode/history-search/venv) holding the semble fork
+# (https://github.com/jabr/semble, branch source-abstraction). uv is only
+# involved when the venv is (re)built — missing, forced via
+# HISTORY_SEARCH_REFRESH=1, or at most daily so the branch pin picks up fork
+# updates (soft-failing to the existing venv when offline). Query-time runs
+# exec the venv python directly.
+#
+# Why not `uv run --with` per invocation: it resolves an ephemeral
+# environment on every run, those environments are cache-disposable (any
+# garbage collection or interpreter change rebuilds and reinstalls every
+# dependency), and interpreter discovery honors .python-version in the cwd —
+# so a new project directory could fork a whole second environment. A
+# pinned, persistent venv has none of that churn.
+#
+# Force a rebuild/update check with: HISTORY_SEARCH_REFRESH=1 history-search …
+set -euo pipefail
+
+# Resolve this script's real location through the ~/.local/bin symlink:
+# BASH_SOURCE is the symlink's path when invoked via PATH, and cd+pwd alone
+# does not resolve a file-level symlink.
+SELF="${BASH_SOURCE[0]}"
+while [[ -L "$SELF" ]]; do
+  DIR="$(cd -P "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  [[ "$SELF" != /* ]] && SELF="$DIR/$SELF"
+done
+DIR="$(cd -P "$(dirname "$SELF")" && pwd)"
+
+ROOT="$HOME/.cache/opencode/history-search"
+VENV="$ROOT/venv" # symlink → venv-<build-time>, swapped atomically
+STAMP="$ROOT/.deps-refresh"
+LOCK="$ROOT/.venv-build.lock.d" # mkdir lock: atomic, and crash-safe via staleness
+REQ="git+https://github.com/jabr/semble@source-abstraction"
+
+build_reason() {
+  [[ ! -x "$VENV/bin/python" ]] && return 0
+  [[ "${HISTORY_SEARCH_REFRESH:-}" == "1" ]] && return 0
+  [[ ! -f "$STAMP" ]] && return 0
+  [[ -n "$(find "$STAMP" -mmin +1440 2>/dev/null)" ]] && return 0
+  return 1
+}
+
+if build_reason; then
+  if mkdir "$LOCK" 2>/dev/null; then
+    # Double-checked: another process may have finished a build while we
+    # waited for the lock (an explicit HISTORY_SEARCH_REFRESH still rebuilds).
+    if build_reason; then
+      target="$ROOT/venv-$(date +%Y%m%d%H%M%S)"
+      # Floating major (an explicit request ignores .python-version in the
+      # cwd, so a project can't fork the interpreter): use the newest
+      # managed uv python, transparently migrating at a later rebuild if a
+      # newer one is installed. A brand-new CPython whose deps lack wheels
+      # fails the build — which soft-fails to the existing venv and retries
+      # next rebuild, so floating forward never breaks a running search.
+      if uv venv --python 3 "$target" && uv pip install --python "$target/bin/python" --refresh-package semble "$REQ"; then
+        # BSD mv moves *into* a symlinked directory (no -T on macOS), so the
+        # swap is ln -sfn instead. Its microscopic unlink gap self-heals: a
+        # searcher hitting the missing venv waits on the build lock, which is
+        # released right after this line.
+        ln -sfn "$target" "$VENV"
+        touch "$STAMP"
+        # Old builds linger briefly for in-flight processes, then go.
+        find "$ROOT" -maxdepth 1 -type d -name "venv-*" -mmin +60 -exec rm -rf {} + 2>/dev/null || true
+      else
+        rm -rf "$target"
+        if [[ ! -x "$VENV/bin/python" ]]; then
+          rm -rf "$LOCK"
+          echo "history-search: venv build failed and none exists — is uv or the network available?" >&2
+          exit 1
+        fi
+        # Build failed (offline?) but an existing venv survives: use it as-is.
+      fi
+    fi
+    rm -rf "$LOCK"
+  else
+    # Someone else is building: wait for a usable venv (or a stale lock,
+    # which a crashed builder leaves behind — cleared after 10 minutes).
+    while [[ ! -x "$VENV/bin/python" ]] && [[ -d "$LOCK" ]]; do
+      if [[ -n "$(find "$LOCK" -mmin +10 2>/dev/null)" ]]; then
+        rm -rf "$LOCK" 2>/dev/null || true
+        break
+      fi
+      sleep 0.5
+    done
+  fi
+fi
+
+exec "$VENV/bin/python" "$DIR/search.py" "$@"
