@@ -69,6 +69,20 @@ The tool is registered `codemode: true` (catalog-only in Code Mode sessions),
 so it costs ~zero context there and is invoked as `tools.history.search`
 inside `execute`.
 
+### `history_expand`
+
+One message by ID (`msg_…`, as carried by search results): the raw
+`session_message` record — `messageID`, `sessionID`, `type`, `seq`, `time`,
+and the complete `data` JSON (parsed), with text, reasoning, and tool calls
+and their results.
+
+| Parameter | Meaning |
+|---|---|
+| `message` | message ID (required; a `ses_…/msg_….md` path suffix is accepted) |
+
+In Code Mode: `tools.history.expand({ message: "msg_…" })`; in a shell,
+`history-search -m msg_…` renders the message as a transcript block.
+
 ## The `history-search` CLI
 
 One CLI, two faces: markdown-through-mdcat for humans (the terminal twin of

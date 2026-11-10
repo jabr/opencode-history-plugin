@@ -1,7 +1,7 @@
 // history — conversation-history search for OpenCode v2.
 //
-// One tool (registered Code Mode catalog-only via `codemode: true`, so it
-// costs ~zero context in Code Mode sessions):
+// Two tools (registered Code Mode catalog-only via `codemode: true`, so they
+// cost ~zero context in Code Mode sessions):
 //
 //   history_search  retrieval over full conversation transcripts — what
 //                   sessions discussed, decided, or tried. Scope: 'all' (the
@@ -9,7 +9,10 @@
 //                   this is memory, not just team curiosity) or a session ID
 //                   for exactly that conversation. `project` opts into
 //                   another project's history.
-//
+//   history_expand  one message by ID, fetched read-only from the opencode
+//                   DB and returned as the raw record — the read-companion
+//                   to a search hit (results carry messageID). No CLI, no
+//                   index.
 // Powered by the semble fork (https://github.com/jabr/semble, branch
 // source-abstraction) reading opencode's SQLite DB directly as a document
 // source — the DB IS the corpus, so there is no sync/materialization layer:
@@ -67,6 +70,9 @@
 //    CLI wrapper entirely (library, JSON via argparse), so this is moot.
 // ---------------------------------------------------------------------------
 import { spawnSync } from "node:child_process"
+import { existsSync } from "node:fs"
+import { DatabaseSync } from "node:sqlite"
+import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { Plugin } from "@opencode/plugin"
@@ -74,11 +80,31 @@ import { Plugin } from "@opencode/plugin"
 const MAX_TEXT = 500
 const DEFAULT_LIMIT = 20
 const LAUNCHER = path.join(path.dirname(fileURLToPath(import.meta.url)), "history-search")
+// Same default as search.py's DEFAULT_DB.
+const DB_PATH = path.join(os.homedir(), ".local", "share", "opencode", "opencode.db")
 
 // Keep tool output compact — snippets are truncated per hit.
 function truncate(text: string, max = MAX_TEXT): string {
   const flat = text.replace(/\s+/g, " ").trim()
   return flat.length > max ? `${flat.slice(0, max)}…` : flat
+}
+
+/** Run the CLI launcher, surfacing launcher-level failures with hints. */
+function runLauncher(args: string[], label: string): string {
+  const run = spawnSync(LAUNCHER, args, { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 })
+  if (run.error) {
+    const errno = run.error as NodeJS.ErrnoException
+    const hint =
+      errno.code === "ENOENT" ? " — the launcher should live beside this file (history-search, next to index.ts)" : ""
+    throw new Error(`${label}: ${run.error.message}${hint}`)
+  }
+  if (run.status !== 0) {
+    // The last stderr lines usually name the real cause (missing DB,
+    // scope violation, offline uv …).
+    const tail = run.stderr.trim().split("\n").slice(-3).join(" ")
+    throw new Error(`${label}: ${tail || `exited with status ${run.status}`}`)
+  }
+  return run.stdout
 }
 
 /** One search result row, as emitted by search.py --json. Only IDs that vary
@@ -116,8 +142,8 @@ export default Plugin.define({
           "Indexes whole transcripts (reasoning, tool calls, and results included); " +
           "results carry sessionID + messageID + snippet per hit, enriched with the session title, " +
           "message type, timestamp, and (cross-project) the owning directory. " +
-          "Defaults to all sessions in the project; `scope` narrows to one conversation. " +
-          "A terminal twin, `history-search`, exists on PATH for shell pipelines.",
+          "Expand a hit in full with history.expand. " +
+          "Defaults to all sessions in the project; `scope` narrows to one conversation.",
         input: {
           type: "object",
           properties: {
@@ -191,20 +217,7 @@ export default Plugin.define({
           const args = ["--json", "-k", String(input.limit ?? DEFAULT_LIMIT), "--project", scope]
           if (input.scope && input.scope !== "all") args.push("--session", input.scope)
           args.push(input.query)
-          const run = spawnSync(LAUNCHER, args, { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 })
-          if (run.error) {
-            const errno = run.error as NodeJS.ErrnoException
-            const hint =
-              errno.code === "ENOENT" ? " — the launcher should live beside this file (history-search, next to index.ts)" : ""
-            throw new Error(`history search: ${run.error.message}${hint}`)
-          }
-          if (run.status !== 0) {
-            // The last stderr lines usually name the real cause (missing DB,
-            // scope violation, offline uv …).
-            const tail = run.stderr.trim().split("\n").slice(-3).join(" ")
-            throw new Error(`history search: ${tail || `exited with status ${run.status}`}`)
-          }
-          const out = JSON.parse(run.stdout) as {
+          const out = JSON.parse(runLauncher(args, "history search")) as {
             scope?: { project?: string | null; session?: string | null }
             results?: ResultRow[]
             index?: Record<string, unknown>
@@ -212,6 +225,89 @@ export default Plugin.define({
           const results = (out.results ?? []).map((row) => ({ ...row, snippet: truncate(row.snippet) }))
           return {
             output: { query: input.query, scope: out.scope, results, index: out.index },
+          }
+        },
+      })
+
+      editor.add({
+        name: "expand",
+        description:
+          "Expand one conversation-history message in full by ID (msg_…): the raw message record — " +
+          "messageID, sessionID, type, seq, time, and the complete persisted data JSON (parsed), with text, " +
+          "reasoning, and tool calls and their results. " +
+          "The read-companion to a search hit (search results carry messageID).",
+        input: {
+          type: "object",
+          properties: {
+            message: {
+              type: "string",
+              description: "message ID (msg_…, as carried by search results; a path suffix like ses_…/msg_….md is accepted).",
+            },
+          },
+          required: ["message"],
+          additionalProperties: false,
+        },
+        // Same JSON Schema output discipline as search: typed object in Code
+        // Mode, shape documented, not strictly validated. `data` is the
+        // message's persisted JSON — any shape, so its schema is open.
+        output: {
+          type: "object",
+          properties: {
+            messageID: { type: "string" },
+            sessionID: { type: "string" },
+            type: { type: "string" },
+            seq: { type: "integer" },
+            time: {
+              type: "object",
+              properties: { created: { type: "integer" }, updated: { type: "integer" } },
+            },
+            data: { description: "the message's persisted data JSON, parsed as-is" },
+          },
+          required: ["messageID", "sessionID", "type", "seq", "time", "data"],
+        },
+        options: { namespace: "history", permission: "history_expand", codemode: true },
+        execute: async (raw) => {
+          const input = raw as { message: string }
+          if (!input.message) throw new Error("history expand: message ID is required")
+          // Same normalization as the CLI twin: a ses_…/msg_….md path suffix is accepted.
+          const target = path.basename(input.message.replace(/\.md$/, ""))
+          if (!existsSync(DB_PATH)) throw new Error(`history expand: database not found at ${DB_PATH}`)
+          const db = new DatabaseSync(DB_PATH, { readOnly: true })
+          let row: {
+            id: string
+            session_id: string
+            type: string
+            seq: number
+            time_created: number
+            time_updated: number
+            data: string
+          }
+          try {
+            const found = db
+              .prepare(
+                "SELECT id, session_id, type, seq, time_created, time_updated, data FROM session_message WHERE id = ?",
+              )
+              .get(target)
+            if (!found) throw new Error(`history expand: no message found for ${input.message}`)
+            row = found as typeof row
+          } finally {
+            db.close()
+          }
+          // `data` is the message's persisted JSON; malformed rows keep the
+          // raw string rather than failing the read.
+          let data: unknown = row.data
+          try {
+            data = JSON.parse(row.data)
+          } catch {}
+          return {
+            output: {
+              messageID: row.id,
+              sessionID: row.session_id,
+              type: row.type,
+              seq: row.seq,
+              time: { created: row.time_created, updated: row.time_updated },
+              data,
+            },
           }
         },
       })
@@ -234,7 +330,8 @@ export default Plugin.define({
         text:
           "Conversation-history memory is active (history plugin): past sessions' full transcripts are searchable. " +
           "For \"why did we do X\" or what was previously discussed, decided, or tried, query it rather than " +
-          "re-deriving the answer from current code — via Code Mode, tools.history.search inside execute. " +
+          "re-deriving the answer from current code — via Code Mode, tools.history.search inside execute, and " +
+          "tools.history.expand({ message }) for one hit's full content. " +
           "It covers this project's sessions by default, the asker's own history included." +
           (twinOnPath
             ? " A terminal twin, `history-search`, is on PATH for shell pipelines."
